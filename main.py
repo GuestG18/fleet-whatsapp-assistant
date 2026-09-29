@@ -2,6 +2,7 @@ import os
 import re
 import html
 import unicodedata
+from typing import Dict, List
 
 import httpx
 from fastapi import FastAPI, Form
@@ -20,6 +21,13 @@ FLEET_ASSISTANT_API_TOKEN = os.getenv(
     ""
 )
 
+TRIPS_PER_PAGE = 6
+
+# MVP: memorie în RAM.
+# Cheie = numărul WhatsApp
+# Valoare = datele ultimei liste + pagina curentă.
+conversation_state: Dict[str, dict] = {}
+
 
 @app.get("/")
 def root():
@@ -29,14 +37,6 @@ def root():
 
 
 def normalize_message(text: str) -> str:
-    """
-    Normalizează mesajele astfel încât:
-    - să ignore litere mari/mici
-    - să ignore diacriticele
-    - să ignore semnele de punctuație
-    - să ignore spațiile multiple
-    """
-
     text = text.strip().lower()
 
     text = unicodedata.normalize("NFKD", text)
@@ -91,96 +91,91 @@ async def get_today_trips(
         return response.json()
 
 
-def format_today_trips(
-    data: dict
-) -> str:
+def format_trip(
+    trip: dict,
+    index: int
+) -> List[str]:
 
-    trips = data.get(
-        "trips",
-        []
-    )
-
-    count = data.get(
-        "count",
-        len(trips)
-    )
-
-    if not trips:
-        return (
-            "Nu există curse active "
-            "pentru astăzi."
-        )
+    vehicle = trip.get("vehicle") or "-"
+    route = trip.get("route") or "-"
+    driver = trip.get("driver") or "-"
+    start = trip.get("start") or "-"
+    start_date = trip.get("start_date") or ""
 
     lines = [
-        f"Curse active astăzi: {count}",
-        ""
+        f"{index}. {vehicle}",
+        route,
+        f"{driver} · {start}",
     ]
 
-    for index, trip in enumerate(
-        trips,
-        start=1
-    ):
-
-        vehicle = (
-            trip.get("vehicle")
-            or "-"
+    if start_date:
+        lines[-1] = (
+            f"{driver} · "
+            f"{start_date} {start}"
         )
 
-        route = (
-            trip.get("route")
-            or "-"
-        )
+    return lines
 
-        driver = (
-            trip.get("driver")
-            or "-"
-        )
 
-        start = (
-            trip.get("start")
-            or "-"
-        )
+def format_trip_page(
+    trips: List[dict],
+    page: int
+) -> str:
 
-        status = (
-            trip.get("status")
-            or "-"
-        )
+    total = len(trips)
 
-        start_date = (
-            trip.get("start_date")
-            or ""
-        )
+    start_index = page * TRIPS_PER_PAGE
+    end_index = start_index + TRIPS_PER_PAGE
 
+    current = trips[
+        start_index:end_index
+    ]
+
+    if not current:
+        return "Nu mai sunt alte curse."
+
+    lines = []
+
+    if page == 0:
         lines.append(
-            f"{index}. {vehicle}"
+            f"🚛 Curse active astăzi: {total}"
         )
-
+        lines.append("")
+    else:
         lines.append(
-            f"Ruta: {route}"
+            f"🚛 Continuare curse "
+            f"({start_index + 1}-{min(end_index, total)} "
+            f"din {total})"
         )
-
-        lines.append(
-            f"Șofer: {driver}"
-        )
-
-        if start_date:
-            lines.append(
-                f"Start: {start_date} {start}"
-            )
-        else:
-            lines.append(
-                f"Start: {start}"
-            )
-
-        lines.append(
-            f"Status: {status}"
-        )
-
         lines.append("")
 
-    return "\n".join(
-        lines
-    ).strip()
+    for offset, trip in enumerate(
+        current,
+        start=start_index + 1
+    ):
+        lines.extend(
+            format_trip(
+                trip,
+                offset
+            )
+        )
+        lines.append("")
+
+    remaining = total - end_index
+
+    if remaining > 0:
+        lines.append(
+            f"Mai sunt {remaining} curse."
+        )
+        lines.append(
+            'Scrie „mai multe” pentru continuare.'
+        )
+    else:
+        lines.append(
+            "Ai ajuns la finalul listei."
+        )
+
+    return "\n".join(lines).strip()
 
 
 def twiml_response(
@@ -245,6 +240,14 @@ async def whatsapp(
         "arata curse azi",
     }
 
+    more_commands = {
+        "mai multe",
+        "continua",
+        "continuare",
+        "urmatoarele",
+        "urmatoarea pagina",
+    }
+
     greeting_commands = {
         "salut",
         "hello",
@@ -261,15 +264,72 @@ async def whatsapp(
                 whatsapp_user
             )
 
-            reply = format_today_trips(
-                data
+            trips = data.get(
+                "trips",
+                []
             )
+
+            conversation_state[
+                whatsapp_user
+            ] = {
+                "type": "today_trips",
+                "trips": trips,
+                "page": 0,
+            }
+
+            reply = format_trip_page(
+                trips,
+                0
+            )
+
+        elif message in more_commands:
+
+            state = conversation_state.get(
+                whatsapp_user
+            )
+
+            if not state:
+                reply = (
+                    "Nu am o listă activă pentru continuare.\n\n"
+                    "Încearcă:\n"
+                    "„Arată cursele de azi”"
+                )
+
+            elif state.get("type") == "today_trips":
+
+                next_page = (
+                    state.get("page", 0)
+                    + 1
+                )
+
+                trips = state.get(
+                    "trips",
+                    []
+                )
+
+                start_index = (
+                    next_page
+                    * TRIPS_PER_PAGE
+                )
+
+                if start_index >= len(trips):
+                    reply = (
+                        "Nu mai sunt alte curse."
+                    )
+
+                else:
+                    state["page"] = next_page
+
+                    reply = format_trip_page(
+                        trips,
+                        next_page
+                    )
 
         elif message in greeting_commands:
 
             reply = (
                 "Salut! Sunt Fleet Assistant.\n\n"
-                "Momentan poți încerca:\n"
+                "Poți încerca:\n"
                 "„Arată cursele de azi”"
             )
 
@@ -296,16 +356,14 @@ async def whatsapp(
 
             reply = (
                 "Fleet Assistant nu este "
-                "autorizat să acceseze "
-                "Fleet App."
+                "autorizat să acceseze Fleet App."
             )
 
         elif status_code == 403:
 
             reply = (
-                "Nu ai permisiunea "
-                "necesară pentru această "
-                "informație."
+                "Nu ai permisiunea necesară "
+                "pentru această informație."
             )
 
         elif status_code == 404:
